@@ -1,5 +1,14 @@
 # 更新日志
 
+## v2.2（versionCode 4）
+
+仅元信息与文档变更，脚本逻辑与 v2.1 完全相同：
+
+- 作者改为 **CodeFishK**
+- 模块说明里补上适用的 root 环境：[GhostSam](https://github.com/snothin/GhostSam)
+- `module.yaml` 补 `authors` / `homepage` / `support` 字段
+- README 增加「相关项目与致谢」，实测机型处标注 GhostSam 链接
+
 ## v2.1（versionCode 3）
 
 - 新增 `night` 子命令：一条命令把夜间模式还原成「自动（日落到日出）」，不需要 root

@@ -7,8 +7,12 @@
 > 折叠屏的副屏（`port=148`）不会消失。
 
 已实测机型：三星 Z Fold7（SM-F966B，Android 15 / One UI，内核 6.6.127，
-KMI `android15-6.6`，GhostSam 晚加载临时 root）。
+KMI `android15-6.6`，[GhostSam](https://github.com/snothin/GhostSam) 晚加载临时 root）。
 原理与机型无关，其他 KernelSU 设备同样能用；「副屏不掉」这一条是折叠屏专属收益。
+
+- 作者：CodeFishK · https://github.com/CodeFishK
+- 适用 root 环境：[GhostSam](https://github.com/snothin/GhostSam)（三星临时 root，冷启动后需重新获取）
+  或任意 KernelSU / 兼容分支
 
 ---
 
@@ -131,7 +135,7 @@ sh /data/adb/modules/gs_quick_reload/gs-reload-modules.sh night
 3. **不要把日志放在 `/data/local/tmp`**
    某些「隐藏 root / 清理环境」模块会 `rm -rf /data/local/tmp/*`，脚本和日志一起消失。
 
-4. **临时 root（如 GhostSam）冷启动后全部丢失**
+4. **临时 root（如 [GhostSam](https://github.com/snothin/GhostSam)）冷启动后全部丢失**
    root、模块挂载、脚本进程都会没有，需要重新获取 root 再点一次「执行」。
    这是临时 root 的固有行为，不是模块的问题。
 
@@ -161,6 +165,14 @@ KernelSU → 模块 → 移除本模块即可，不会留下挂载。
 脚本会重启 zygote 并调用 `ksud` 的阶段命令，属于对系统运行状态有实际影响的操作，
 请自行判断风险。本模块不修改系统分区，也不触碰 `/data/property` 等危险路径，
 但**任何 root 操作都不能保证在所有 ROM 版本上零风险**。
+
+## 相关项目与致谢
+
+- **[GhostSam](https://github.com/snothin/GhostSam)** —— 三星机型的临时 root 方案，
+  本模块的所有实测都在它提供的晚加载 root 环境下完成。没有它，Z Fold7 上连调试的
+  入口都没有。
+- **KernelSU / KernelSU Next** —— 模块框架与 `ksud` 的阶段命令。
+- 本模块作者：**CodeFishK**（https://github.com/CodeFishK）。
 
 ## 许可证
 
