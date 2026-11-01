@@ -1,30 +1,21 @@
 # 更新日志
 
-## v2.2（versionCode 4）
+## v2.1 —— 初始发布（versionCode 3）
 
-仅元信息与文档变更，脚本逻辑与 v2.1 完全相同：
+首个公开版本。一个按钮让 KernelSU 模块生效，而不用拿折叠屏的副屏去换。
 
-- 作者改为 **CodeFishK**
-- 模块说明里补上适用的 root 环境：[GhostSam](https://github.com/snothin/GhostSam)
-- `module.yaml` 补 `authors` / `homepage` / `support` 字段
-- README 增加「相关项目与致谢」，实测机型处标注 GhostSam 链接
+- 按 KernelSU 自己的流程执行 `post-fs-data` / `services` 两个阶段，然后只 `setprop ctl.restart zygote`，
+  **不执行 `stop` / `start`**，SurfaceFlinger 全程存活，副屏（`port=148`）不掉
+- `boot_completed` 看门狗：先扫描模块脚本里有没有 `resetprop -w` 等待者，有才在重启后制造一次
+  0→1 边沿；没有就只保留「卡 0 太久 → 置 1」的安全网
+- lspd 健康检查：三条硬指标（有 daemon、`lspbridge` 监听 ≥1、pid 不在旧快照）不满足就放弃重启
+  zygote，避免「要点两次才生效」
+- 夜间模式自愈：重启后若昼夜判定被改，先顶一个固定值再还原用户原本的模式；`trap` 保证任何
+  退出路径（终端断开 / 进程被杀）都会还原
+- 子命令：`check` 体检、`mods` 清单、`dump <id>` 打包、`trim` 清理重复实例、`night` 一条命令还原自动
+- 日志落在 `/sdcard/GS/logs/`，不需要 root 就能读
 
-## v2.1（versionCode 3）
+作者：CodeFishK。实测环境：[GhostSam](https://github.com/snothin/GhostSam) 临时 root（三星 Z Fold7），
+理论上任意 KernelSU / 兼容分支通用。
 
-- 新增 `night` 子命令：一条命令把夜间模式还原成「自动（日落到日出）」，不需要 root
-- 夜间守护加 `trap`：任何退出路径（终端断开 / 进程被 kill）都还原用户原本的模式，
-  不再出现「夜间模式卡在固定值」
-- 纠正改为最多 3 轮、每轮回读 `mComputedNightMode` 复验
-- 实测并写入文档：`cmd uimode night auto` 在判定卡错时不会触发重算，
-  必须先给固定值再回 auto
-
-## v2.0（versionCode 2）
-
-- 脚本随模块分发：`action.sh` 三级回退（模块目录 → /data/adb/gs → /data/local/tmp）
-- `customize.sh` 自动备份脚本到 `/data/adb/gs/`、创建日志目录
-
-## v1.x
-
-- 首版：走 `ksud post-fs-data` / `services` 两阶段 + `setprop ctl.restart zygote`
-- boot_completed 看门狗与边沿发生器
-- lspd 健康检查，不健康则放弃重启 zygote（避免「要点两次才生效」）
+> 说明：v1.x、v2.0 是作者本机的内部迭代版本，从未对外发布，故不在此列出。

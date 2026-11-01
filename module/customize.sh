@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # KernelSU 安装脚本：只做权限设置与初始部署，不挂载任何文件
 
-ui_print "- 一键重载模块 v2.2（自带 gs-reload-modules.sh）"
+ui_print "- 一键重载模块 v2.1（自带 gs-reload-modules.sh）"
 ui_print "- 特点：只重启 zygote，不执行 stop/start，折叠屏副屏不会掉"
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
