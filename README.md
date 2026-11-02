@@ -1,14 +1,25 @@
-# 一键重载模块（gs_quick_reload）
+# 一键重载模块（gs_quick_reload）· 三星 Galaxy Z Fold7 专用
 
 > **一个按钮，让 KernelSU 模块生效——而不用拿折叠屏的副屏去换。**
 >
+> 专为 **三星 Galaxy Z Fold7（SM-F966B，One UI 9 / Android 17）** 调制。
 > 点击模块页的「执行」，脚本会按 KernelSU 自己的流程执行 `post-fs-data` / `services`
 > 两个阶段，然后只重启 zygote，**跳过 `stop` / `start`**。SurfaceFlinger 全程存活，
 > 折叠屏的副屏（`port=148`）不会消失。
 
-已实测机型：三星 Z Fold7（SM-F966B，Android 15 / One UI，内核 6.6.127，
-KMI `android15-6.6`，[GhostSam](https://github.com/snothin/GhostSam) 晚加载临时 root）。
-原理与机型无关，其他 KernelSU 设备同样能用；「副屏不掉」这一条是折叠屏专属收益。
+## 适用机型：三星 Galaxy Z Fold7（专用）
+
+> **本模块专为 Z Fold7 调制。** 三星 Galaxy Z Fold7（SM-F966B），
+> 系统 **One UI 9 / Android 17**，内核 6.6.127（KMI `android15-6.6`，
+> 这里的 `android15` 是内核分支命名，与系统版本号无关），
+> root 环境为 [GhostSam](https://github.com/snothin/GhostSam) 晚加载临时 root。
+
+整套流程、看门狗时序、夜间模式纠正逻辑、lspd 健康判据，都是在这一台机器上反复实测调出来的
+（包括「副屏 `port=148` 整场不掉」这个核心收益）。所以默认按 **Fold7 + Android 17** 交付，
+`compatibility.androidMinApi` 也钉在 37（Android 17）。
+
+其他三星折叠屏（Fold6 / Flip 系列）或别的 Android 版本，原理相通但**没有实测**；
+要用的话请先跑一次 `check` 体检，出问题请提 issue 并附机型与系统版本。
 
 - 作者：CodeFishK · https://github.com/CodeFishK
 - 适用 root 环境：[GhostSam](https://github.com/snothin/GhostSam)（三星临时 root，冷启动后需重新获取）

@@ -1,5 +1,16 @@
 # 更新日志
 
+## v2.2 —— 机型定位与系统版本订正（versionCode 4）
+
+**修正说明文字**：系统实际为 **Android 17（One UI 9）**，面向机型明确为 **三星 Galaxy Z Fold7**。
+脚本逻辑无改动，只改元信息与文档，装了 v2.1 可以不升级。
+
+- `module.prop` / `module.yaml` 的名称改为「一键重载模块（Fold7）」，说明开头即写明
+  三星 Galaxy Z Fold7（SM-F966B / One UI 9 / Android 17）专用
+- `compatibility.androidMinApi` 由 35（Android 15）改为 **37（Android 17）**，
+  与文档一致；内核分支名 `android15-6.6` 是 KMI 命名，与系统版本无关，文档里已注明
+- README 新增「适用机型：三星 Galaxy Z Fold7（专用）」一节，说明实测环境与未实测机型的边界
+
 ## v2.1 —— 初始发布（versionCode 3）
 
 首个公开版本。一个按钮让 KernelSU 模块生效，而不用拿折叠屏的副屏去换。
@@ -15,7 +26,7 @@
 - 子命令：`check` 体检、`mods` 清单、`dump <id>` 打包、`trim` 清理重复实例、`night` 一条命令还原自动
 - 日志落在 `/sdcard/GS/logs/`，不需要 root 就能读
 
-作者：CodeFishK。实测环境：[GhostSam](https://github.com/snothin/GhostSam) 临时 root（三星 Z Fold7），
-理论上任意 KernelSU / 兼容分支通用。
+作者：CodeFishK。实测环境：三星 Galaxy Z Fold7（SM-F966B，One UI 9 / Android 17）+
+[GhostSam](https://github.com/snothin/GhostSam) 临时 root。
 
 > 说明：v1.x、v2.0 是作者本机的内部迭代版本，从未对外发布，故不在此列出。
