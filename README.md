@@ -7,6 +7,43 @@
 > 两个阶段，然后只重启 zygote，**跳过 `stop` / `start`**。SurfaceFlinger 全程存活，
 > 折叠屏的副屏（`port=148`）不会消失。
 
+## Vector / NeoZygisk support in this fork
+
+This fork adds separate handling for enabled `zygisk_vector` (Vector) and
+`zygisk_lsposed` (LSPosed) modules, including renamed module directories.
+Disabled or removal-pending modules are ignored. Enabling both frameworks
+aborts before any boot-state change or module stage.
+
+For Vector, the reload requires exactly one `vectord` process and a successful,
+bounded response from its bundled `cli status` command. Vector builds without
+that CLI abort before replaying stages; process existence alone is not treated
+as a readiness check. The check proves daemon IPC is responding, **not** that
+every app will be injected after Zygote restarts. It does not kill Vector daemons
+or blindly rerun Vector's `service.sh` to recover a failure.
+
+NeoZygisk is identified from module metadata rather than assuming that every
+`zygisksu` installation is Zygisk Next. Zygisk Next's `zn-daemon` deduplication
+is only applied to that implementation.
+
+When this script changes `sys.boot_completed`, exits or catchable signals before
+the Zygote restart request restore the previous value. Stage-command failures
+also abort the restart. After an accepted restart request, the existing detached
+watchdog handles boot-state recovery. Restoring the property does not undo
+module scripts or mounts already applied; SIGKILL cannot run shell cleanup.
+
+Validation: `sh -n module/gs-reload-modules.sh` and
+`python3 -m unittest discover -s tests -v` (host mocks, no Android operations).
+**These fork changes have not been validated on a phone, including CZJ1.**
+The device-test claims in the original documentation below belong to upstream.
+
+Implementation references:
+- [Vector service startup](https://github.com/JingMatrix/Vector/blob/master/zygisk/module/service.sh)
+- [Vector daemon launcher](https://github.com/JingMatrix/Vector/blob/master/zygisk/module/daemon)
+- [Vector CLI and exit status](https://github.com/JingMatrix/Vector/blob/master/daemon/src/main/kotlin/org/matrix/vector/daemon/Cli.kt)
+- [NeoZygisk service stage](https://github.com/JingMatrix/NeoZygisk/blob/master/module/src/service.sh)
+
+---
+
 ## 适用机型：三星 Galaxy Z Fold7（专用）
 
 > **本模块专为 Z Fold7 调制。** 三星 Galaxy Z Fold7（SM-F966B），

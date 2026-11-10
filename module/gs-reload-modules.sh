@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# gs-reload-modules.sh  v21 — 让 KernelSU 模块生效，但不执行 stop/start
+# gs-reload-modules.sh  v22 — 让 KernelSU 模块生效，但不执行 stop/start
 # （随「一键重载模块 gs_quick_reload」一起分发，装在 /data/adb/modules/gs_quick_reload/）
 #
 # 背景：KernelSU 的「软重启」== ksud 的 soft_reboot()，实际序列是：
@@ -302,20 +302,105 @@ run_quiet() {
     return $_rc
 }
 
+# BEGIN framework helpers
+# Detect enabled modules by identity, not a generic "daemon" string in service.sh.
+# Vector supports Xposed APIs but does not expose LSPosed's lspd/lspbridge lifecycle.
+find_enabled_module() {
+    for module_dir in "$MODDIR_BASE"/*; do
+        [ -d "$module_dir" ] || continue
+        [ -f "$module_dir/disable" ] && continue
+        [ -f "$module_dir/remove" ] && continue
+        if tr -d '\r' < "$module_dir/module.prop" 2>/dev/null | grep -qx "id=$1"; then
+            echo "$module_dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_framework() {
+    VECTOR_DIR=$(find_enabled_module zygisk_vector) || VECTOR_DIR=""
+    LSPOSED_DIR=$(find_enabled_module zygisk_lsposed) || LSPOSED_DIR=""
+    FRAMEWORK_KIND=none
+    if [ -n "$VECTOR_DIR" ] && [ -n "$LSPOSED_DIR" ]; then
+        echo "[X] Both Vector and LSPosed are enabled; reload aborted."
+        return 1
+    fi
+    [ -n "$LSPOSED_DIR" ] && FRAMEWORK_KIND=lsposed
+    if [ -n "$VECTOR_DIR" ]; then
+        FRAMEWORK_KIND=vector
+        if [ ! -f "$VECTOR_DIR/cli" ] || ! command -v timeout >/dev/null 2>&1; then
+            echo "[X] Vector reload needs its bundled cli and timeout for a bounded readiness check."
+            echo "    No boot property or module stage has been changed."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+zygisk_kind() {
+    zygisk_dir=$(find_enabled_module zygisksu) || { echo none; return; }
+    zygisk_name=$(sed -n 's/^name=//p' "$zygisk_dir/module.prop" | head -1)
+    case "$zygisk_name" in
+        *NeoZygisk*) echo neozygisk ;;
+        *"Zygisk Next"*) echo zygisk-next ;;
+        *) echo unknown ;;
+    esac
+}
+
+vector_ready() {
+    vector_pids=$(pidof vectord 2>/dev/null)
+    set -- $vector_pids
+    [ "$#" -eq 1 ] || return 1
+    # This probes the daemon's IPC, not just a PID or an unrelated unix socket.
+    # It does not prove injection into every app after the upcoming zygote restart.
+    timeout 3 sh "$VECTOR_DIR/cli" status >/dev/null 2>&1
+}
+
+ensure_vector() {
+    vector_attempt=0
+    while [ "$vector_attempt" -lt 20 ]; do
+        if vector_ready; then
+            tlog "Vector daemon IPC ready: vectord=$(pidof vectord 2>/dev/null)"
+            return 0
+        fi
+        vector_attempt=$((vector_attempt + 1))
+        sleep 1
+    done
+    echo "[X] Vector daemon IPC is not ready or multiple vectord processes exist."
+    echo "    Zygote will not restart. No extra Vector service.sh or daemon kill was attempted."
+    tlog "Vector readiness failed; vectord=$(pidof vectord 2>/dev/null)"
+    return 1
+}
+
+ensure_framework() {
+    case "$FRAMEWORK_KIND" in
+        vector) ensure_vector ;;
+        lsposed) ensure_lspd "${1:-}" ;;
+        none) tlog "No enabled Vector/LSPosed module; skipping Xposed daemon gate" ;;
+    esac
+}
+
+# Restore only the property this run changed, and only before restart handoff.
+# Module stages cannot be rolled back by restoring this flag.
+restore_boot_state() {
+    if [ "${BOOT_CHANGED:-0}" = "1" ] && [ "${BOOT_HANDOFF:-0}" = "0" ]; then
+        if "$BOOT_RESETPROP" sys.boot_completed "$BOOT_ORIGINAL"; then
+            BOOT_CHANGED=0
+            tlog "Abort cleanup: restored sys.boot_completed=$BOOT_ORIGINAL; module stages may have run"
+        else
+            echo "[X] Failed to restore sys.boot_completed=$BOOT_ORIGINAL" >&2
+        fi
+    fi
+    return 0
+}
+# END framework helpers
+
 # v9：按 module.prop 的 id 找 LSPosed 模块目录，不再硬编码目录名。
 #   KernelSU 允许模块目录名与 id 不同（实测本机出现了 /data/adb/modules/m_rcq
 #   这类与 id 不一致的目录），硬编码 zygisk_lsposed 会找不到。
 find_lsposed_dir() {
-    for d in "$MODDIR_BASE"/*; do
-        [ -d "$d" ] || continue
-        if grep -qs '^id=zygisk_lsposed' "$d/module.prop" 2>/dev/null; then echo "$d"; return 0; fi
-    done
-    # 退一步：任何 service.sh 里出现 lspd/daemon 的目录
-    for d in "$MODDIR_BASE"/*; do
-        [ -f "$d/service.sh" ] || continue
-        if grep -qs 'lspd\|LSPOSED\|daemon' "$d/service.sh" 2>/dev/null; then echo "$d"; return 0; fi
-    done
-    return 1
+    find_enabled_module zygisk_lsposed
 }
 
 # v15：找出「依赖 sys.boot_completed 0→1 边沿」的模块。
@@ -798,6 +883,18 @@ if [ "$(getprop sys.boot_completed)" != "1" ]; then
     exit 1
 fi
 
+# Validate the installed framework before replaying stages or changing boot state.
+detect_framework || exit 3
+ZYGISK_KIND=$(zygisk_kind)
+BOOT_ORIGINAL=$(getprop sys.boot_completed)
+BOOT_CHANGED=0
+BOOT_HANDOFF=0
+BOOT_RESETPROP=""
+trap 'restore_boot_state' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # 兜底：逐模块跑脚本（不做挂载）。输出同样走文件，避免后台 daemon 占住管道。
 run_one() {
     _dir=$1
@@ -852,7 +949,14 @@ else
     if [ "$DO_ZYGOTE" = "1" ]; then
         _rp=$(command -v resetprop 2>/dev/null || echo /data/adb/ksu/bin/resetprop)
         if [ -x "$_rp" ]; then
+            BOOT_RESETPROP=$_rp
+            BOOT_CHANGED=1
             "$_rp" sys.boot_completed 0 2>/dev/null
+            _boot_rc=$?
+            if [ "$_boot_rc" -ne 0 ] || [ "$(getprop sys.boot_completed)" != "0" ]; then
+                echo "[X] Could not reset boot state; aborting before module stages."
+                exit 3
+            fi
             echo "    --- 已置 sys.boot_completed=0（供依赖启动阶段的模块使用）"
             tlog "resetprop sys.boot_completed 0（模拟 ksud soft_reboot 的启动阶段切换）"
         else
@@ -868,6 +972,10 @@ else
     _rc=$?
     echo "    exit=$_rc"
     tlog "stage post-fs-data 结束 exit=$_rc 累计=$(( $(date +%s) - T0 ))s"
+    if [ "$_rc" -ne 0 ]; then
+        echo "[X] post-fs-data failed; zygote will not restart."
+        exit "$_rc"
+    fi
     tlog "modules: $(ls "$MODDIR_BASE" 2>/dev/null | tr '\n' ' ')"
 
     echo
@@ -895,21 +1003,27 @@ else
     _rc=$?
     echo "    exit=$_rc"
     tlog "stage services 结束 exit=$_rc 累计=$(( $(date +%s) - T0 ))s"
+    if [ "$_rc" -ne 0 ]; then
+        echo "[X] services failed; zygote will not restart."
+        exit "$_rc"
+    fi
     # v20：lspd 绝对不能走 dedupe（"留旧杀新"会和 `daemon --force` 互撞，
     # 结果是新旧全没）。zn-daemon 没有这个语义，照旧只清本次新增。
-    dedupe_new zn-daemon "$_snap_zn"
+    [ "$ZYGISK_KIND" = "zygisk-next" ] && dedupe_new zn-daemon "$_snap_zn"
 
     echo
-    echo "==== lspd 健康检查（必须有一个、且 lspbridge 在监听）===="
-    tlog "services 前 lspd 快照: [$_snap_lspd]"
-    ensure_lspd "$_snap_lspd"
+    echo "==== Xposed daemon readiness: $FRAMEWORK_KIND / $ZYGISK_KIND ===="
 fi
+
+# Apply the same readiness gate to the fallback path. Vector is never passed to
+# LSPosed's lspd recovery or duplicate-process cleanup.
+ensure_framework "${_snap_lspd:-}" || exit 3
 
 echo
 echo "== 模块脚本是否跑起来（看进程）=="
 _dup_lspd=$(pidof lspd 2>/dev/null | wc -w | tr -d ' ')
 _dup_zn=$(pidof zn-daemon 2>/dev/null | wc -w | tr -d ' ')
-ps -A -o NAME 2>/dev/null | grep -iE 'lspd|yhyc|zygiskd|sulogd|zn-daemon' | sort | uniq -c | sed 's/^/    /' || echo "    (无)"
+ps -A -o NAME 2>/dev/null | grep -iE 'lspd|vectord|yhyc|zygiskd|zygisk-ptrace|sulogd|zn-daemon' | sort | uniq -c | sed 's/^/    /' || echo "    (无)"
 [ "$_dup_lspd" -gt 1 ] 2>/dev/null && echo "    [!] lspd 有 $_dup_lspd 个实例，应为 1 个"
 
 echo
@@ -924,7 +1038,8 @@ for d in "$MODDIR_BASE"/*; do
     [ -f "$d/disable" ] && _st="${_st}已禁用"
     [ -f "$d/remove" ] && _st="${_st}待移除"
     case "$_id" in
-        zygisksu)     _st="${_st} Zygisk Next：zn-daemon ${_dup_zn} 个" ;;
+        zygisksu)     _st="${_st} implementation=$ZYGISK_KIND (see module name above)" ;;
+        zygisk_vector) _st="${_st} Vector：vectord=$(pidof vectord 2>/dev/null)" ;;
         zygisk_lsposed) _st="${_st} LSPosed：lspd ${_dup_lspd} 个" ;;
         hma_oss_zygisk)
             _hj=""
@@ -943,6 +1058,7 @@ if [ -d "$MODDIR_BASE/bszip" ]; then
 fi
 
 echo
+if [ "$FRAMEWORK_KIND" = "lsposed" ]; then
 echo "== LSPosed 握手检查 =="
 _pid=$(pidof lspd 2>/dev/null)
 if [ -r /proc/net/unix ]; then
@@ -958,6 +1074,12 @@ if [ -z "$_pid" ]; then
     echo "    [!] lspd 没在跑，重启 zygote 后 LSPosed 会 Connection refused"
     echo "        改用：setsid sh /data/adb/modules/zygisk_lsposed/service.sh </dev/null >/dev/null 2>&1 &"
     tlog "警告: lspd 未运行"
+fi
+else
+    echo "== Xposed daemon =="
+    echo "    framework=$FRAMEWORK_KIND zygisk=$ZYGISK_KIND vectord=$(pidof vectord 2>/dev/null)"
+    echo "    Vector is not tested using lspd/lspbridge or zn-daemon."
+    _pid=""
 fi
 
 echo
@@ -1173,23 +1295,20 @@ EOS
     echo "    --- 已挂 boot_completed 看门狗（等待模块：$_ws｜日志 $LOGDIR/gs-boot-wd.log）"
 }
 
-# v20：lspd 不健康就绝不重启 zygote。
-#   重启后 zygote 会拿着新 uuid 去连 lspbridge，连不上就是 111 刷屏、所有模块失效，
-#   而那时终端已经断开，只能再点一次「执行」—— 这就是「要点两次才生效」的由来。
-#   宁可这一次什么也不做，也不要把手机留在无注入状态。
-if [ "${LSPD_FATAL:-0}" = "1" ]; then
-    echo
-    echo "[X] lspd 不健康，已放弃重启 zygote（当前系统状态未被改动）"
-    echo "    日志：$PERSIST"
-    tlog "中止: lspd 不健康，未重启 zygote"
-    exit 3
-fi
-
+# Framework readiness was checked immediately after module stages, before any
+# night-mode helper was launched. An abort there runs restore_boot_state.
 [ "$DO_ZYGOTE" = "1" ] && boot_watchdog_start
 
 echo "[*] 重启 zygote ..."
 tlog "下发 setprop ctl.restart zygote（累计 $(( $(date +%s) - T0 ))s）"
-setprop ctl.restart zygote
+# Transfer boot-state recovery to the detached watchdog before the terminal can
+# receive HUP. If init rejects the request, the EXIT trap still restores it.
+BOOT_HANDOFF=1
+if ! setprop ctl.restart zygote; then
+    BOOT_HANDOFF=0
+    echo "[X] Zygote restart request failed."
+    exit 3
+fi
 tlog "zygote 重启已下发，本次 reload 结束"
 echo "[+] 已下发。终端会立即断开，约 10-20 秒回到锁屏。"
 echo "    副屏不应受影响；若断开后副屏黑了，说明走的是 stop/start 那条路。"
