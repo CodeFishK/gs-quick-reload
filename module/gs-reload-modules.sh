@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# gs-reload-modules.sh  v22 — 让 KernelSU 模块生效，但不执行 stop/start
+# gs-reload-modules.sh  v23 — 让 KernelSU 模块生效，但不执行 stop/start
 # （随「一键重载模块 gs_quick_reload」一起分发，装在 /data/adb/modules/gs_quick_reload/）
 #
 # 背景：KernelSU 的「软重启」== ksud 的 soft_reboot()，实际序列是：
@@ -161,6 +161,16 @@
 #      ③ 之后每 10 分钟复查、持续 12 小时，覆盖日落与日出两个边界（系统不生效也会被拉回）。
 #      ④ 用户一旦改了模式（0/3 → 1/2 等），守护立即退出，不跟用户抢。
 #      ⑤ `night` 子命令同样改为按 Twilight 判定，不再是「沿用系统判定」。
+#
+# v23（模块 2.4）：夜间守护按 11-13 00:12 实测再收一遍。
+#      ① 实测：本机 Twilight 恒为 null（mTwilightService.getLastTwilightState()=null），
+#         系统在 00:12 被 com.samsung.android.lool 莫名拨回浅色；10 分钟一次的复查
+#         让屏幕亮了近 2 分钟。复查间隔 600s → 120s。
+#      ② 判据优先级：Twilight 真实日出日落 → 三星自带「黑暗模式定时」
+#         (settings system display_night_theme_*) → 19:00-07:00 兜底。
+#      ③ 防拉锯：30 分钟内被外部改回 5 次即让位 45 分钟，不跟系统/例程对打。
+#      ④ 日志带 源=sun/sched/fallback、zen、每 30 分钟一次心跳，排查不用猜。
+#      ⑤ 清掉上一版 heredoc 后多出来的一个 EOS（每次执行都会报 EOS: not found）。
 #
 # 用法：
 #   sh /data/adb/modules/gs_quick_reload/gs-reload-modules.sh   # 模块自带副本（推荐）
@@ -1035,18 +1045,19 @@ night_watch_start() {
 
     cat > "$NIGHT_HELPER" <<'EOS'
 #!/system/bin/sh
-# v22 夜间模式守护：按 Twilight 算「此刻该黑还是该亮」，周期性纠偏
-#   MODE = 用户原本的模式（0 自动 / 3 定时 / 1 浅色 / 2 深色）
-#   LOG  = 日志路径
-#   SPAN = 总守护时长（秒），默认 12h；STEP = 复查间隔（秒），默认 10min
-# 实测坑（11-01）：auto 下 computed 卡错时，单发 `cmd uimode night auto` 不触发重算，
-#   必须先给一个明确的固定值把它顶过去，再回到 auto 才有用。
-# 实测坑（11-12）：v21 拿「重启前的判定」当基准，一旦重启前就已经是错的，
-#   纠正逻辑会把错的当成对的 —— 所以 v22 改成绝对判据（Twilight）。
+# v24 夜间模式守护
+#   MODE = 用户原本的模式（0 自动 / 3 自定义时间表）
+#   LOG  = 日志路径  SPAN = 总守护时长(秒)  STEP = 复查间隔(秒)
+# 判据优先级：Twilight 真实日出日落 → 三星自带「黑暗模式定时」→ 19:00-07:00 兜底
+# 实测坑（11-01）：auto 下 computed 卡错时单发 `cmd uimode night auto` 不重算，
+#   必须先给固定值顶过去，再回 auto 才生效。
+# 实测坑（11-12）：v21 拿「重启前判定」当基准 → 错的被当成对的，v22 起改绝对判据。
+# 实测坑（11-13）：本机 Twilight 恒为 null，系统判定会莫名跳回浅色（00:12 由
+#   com.samsung.android.lool 触发），所以复查间隔从 600s 收到 120s，并加「防拉锯」。
 MODE=$1
 LOG=${2:-/sdcard/GS/logs/gs-night.log}
 SPAN=${3:-43200}
-STEP=${4:-600}
+STEP=${4:-120}
 
 log() { echo "[$(date +%m-%d' '%H:%M:%S)] $*" >> "$LOG"; chmod 644 "$LOG" 2>/dev/null; }
 setmode() {
@@ -1064,23 +1075,48 @@ to_min() {
     [ -z "$_m" ] && _m=0
     echo $((_h*60+_m))
 }
-# 读一次 dumpsys，取出判定与日出日落（Twilight 为空是常态，靠 19:00-07:00 兜底）
+# 三星自带的「黑暗模式定时」（设置-显示-黑暗模式-定时开启），单位分钟
+read_sched() {
+    SCH_ON=""; SCH_OFF=""
+    [ "$(settings get system display_night_theme_scheduled 2>/dev/null)" = "1" ] || return 0
+    [ "$(settings get system display_night_theme_scheduled_type 2>/dev/null)" = "1" ] || return 0
+    _o1=$(settings get system display_night_theme_on_time 2>/dev/null)
+    _o2=$(settings get system display_night_theme_off_time 2>/dev/null)
+    case "$_o1$_o2" in ''|*[!0-9]*) return 0 ;; esac
+    SCH_ON=$_o1; SCH_OFF=$_o2
+}
+fmt_min() {
+    _v=$1
+    [ -z "$_v" ] && { echo "无"; return; }
+    printf '%02d:%02d' $((_v/60)) $((_v%60))
+}
 read_state() {
     _u=$(dumpsys uimode 2>/dev/null)
     C=$(echo "$_u" | grep -o 'mComputedNightMode=[a-z]*' | head -1 | cut -d= -f2)
     [ -z "$C" ] && C=unknown
+    TW=$(echo "$_u" | grep -o 'getLastTwilightState()=[a-z]*' | head -1 | cut -d= -f2)
+    [ -z "$TW" ] && TW=none
     SS=$(echo "$_u" | grep -o 'sunset=[0-9-]* [0-9:]*' | head -1); SS=${SS##* }
     SR=$(echo "$_u" | grep -o 'sunrise=[0-9-]* [0-9:]*' | head -1); SR=${SR##* }
+    ZEN=$(settings get global zen_mode 2>/dev/null)
+    [ -z "$ZEN" ] && ZEN=?
 }
-# 此刻「应该」是不是深色：日落之后或日出之前 → true
+# 此刻「应该」是不是深色
 desired() {
     _now=$(to_min "$(date +%H:%M)")
     if [ -n "$SS" ] && [ -n "$SR" ]; then
-        _ss=$(to_min "$SS"); _sr=$(to_min "$SR")
-        if [ "$_now" -ge "$_ss" ] || [ "$_now" -lt "$_sr" ]; then echo true; else echo false; fi
+        _ss=$(to_min "$SS"); _sr=$(to_min "$SR"); SRC=sun
+    elif [ -n "$SCH_ON" ]; then
+        _ss=$SCH_ON; _sr=$SCH_OFF; SRC=sched
     else
-        if [ "$_now" -ge 1140 ] || [ "$_now" -lt 420 ]; then echo true; else echo false; fi
+        _ss=1140; _sr=420; SRC=fallback
     fi
+    if [ "$_ss" -lt "$_sr" ]; then
+        if [ "$_now" -ge "$_ss" ] && [ "$_now" -lt "$_sr" ]; then D_WANT=true; else D_WANT=false; fi
+    else
+        if [ "$_now" -ge "$_ss" ] || [ "$_now" -lt "$_sr" ]; then D_WANT=true; else D_WANT=false; fi
+    fi
+    DES_SRC=$SRC
 }
 # 纠正：先顶固定值 → 再回到用户模式（实测必须这个顺序）
 fix() {
@@ -1090,6 +1126,8 @@ fix() {
     sleep 4
     _v=$(settings get secure ui_night_mode 2>/dev/null)
     [ "$_v" = "$MODE" ] || { sleep 1; setmode "$MODE" >/dev/null 2>&1; }
+    read_state
+    [ "$C" = "$1" ] || { sleep 2; if [ "$1" = "true" ]; then cmd uimode night yes; else cmd uimode night no; fi; sleep 2; setmode "$MODE" >/dev/null 2>&1; sleep 3; read_state; }
 }
 restore() {
     trap - EXIT INT TERM HUP
@@ -1101,7 +1139,8 @@ restore() {
 trap 'restore; exit 0' EXIT INT TERM HUP
 
 : > "$LOG"
-log "start mode=$MODE span=${SPAN}s step=${STEP}s"
+read_sched
+log "start mode=$MODE span=${SPAN}s step=${STEP}s 定时=$(fmt_min "$SCH_ON")-$(fmt_min "$SCH_OFF")"
 
 # 等 system_server 起来（重启 zygote 后它可能还在初始化）
 i=0
@@ -1110,6 +1149,7 @@ while [ $i -lt 180 ]; do
     sleep 2; i=$((i+1))
 done
 
+FIXN=0; FIXT=0; YIELD=0; N=0
 # 第一段：重启后 45s、90s 各查一次（这个窗口最容易出现「判定丢失」）
 for _d in 45 45; do
     sleep "$_d"
@@ -1118,44 +1158,53 @@ for _d in 45 45; do
         true|false) ;;
         *) log "首次检查：dumpsys 读不到判定（C=$C），本轮跳过"; continue ;;
     esac
-    D=$(desired)
-    log "首次检查 cur=$C 应为=$D（sunset=${SS:-无} sunrise=${SR:-无}）"
+    desired; D=$D_WANT
+    log "首次检查 cur=$C 应为=$D [$(date +%H:%M) 源=$DES_SRC twilight=$TW zen=$ZEN]"
     if [ "$C" != "$D" ]; then
         fix "$D"
-        read_state
         log "  纠正后 cur=$C"
     fi
 done
 
-# 第二段：周期性复查，覆盖日落/日出两个边界
+# 第二段：周期性复查，覆盖日落/日出两个边界，也盯住系统自己跳回浅色
 _end=$(( $(date +%s) + SPAN ))
-_last=$C
 while [ "$(date +%s)" -lt "$_end" ]; do
     sleep "$STEP"
+    N=$((N+1))
     _m=$(settings get secure ui_night_mode 2>/dev/null)
     if [ "$_m" != "$MODE" ]; then
         log "用户改了模式（$MODE -> $_m），守护退出，不再干预"
         trap - EXIT INT TERM HUP
         exit 0
     fi
+    [ $((N % 15)) -eq 0 ] && read_sched
     read_state
     case "$C" in
         true|false) ;;
-        *) _last=""; continue ;;
+        *) continue ;;
     esac
-    D=$(desired)
-    if [ "$C" != "$D" ]; then
-        log "复查发现偏差 cur=$C 应为=$D（$(date +%m-%d' '%H:%M)），纠正"
-        fix "$D"
-        read_state
-        log "  纠正后 cur=$C"
-    elif [ "$C" != "$_last" ]; then
-        log "状态变化 cur=$C（$(date +%H:%M)），正常"
+    desired; D=$D_WANT
+    if [ "$N" -eq 15 ] || [ $((N % 15)) -eq 0 ]; then
+        log "心跳 cur=$C 应为=$D [$(date +%H:%M) 源=$DES_SRC zen=$ZEN]"
     fi
-    _last=$C
+    [ "$C" = "$D" ] && continue
+    _ts=$(date +%s)
+    if [ "$_ts" -lt "$YIELD" ]; then
+        log "让位中（外部反复改回），不干预：cur=$C 应为=$D [$(date +%H:%M)]"
+        continue
+    fi
+    if [ $((_ts - FIXT)) -le 1800 ]; then FIXN=$((FIXN+1)); else FIXN=1; fi
+    FIXT=$_ts
+    if [ "$FIXN" -ge 5 ]; then
+        YIELD=$((_ts + 2700))
+        log "30min 内第 $FIXN 次被改回，让位 45min（避免与系统/例程拉锯）"
+        continue
+    fi
+    log "复查发现偏差 cur=$C 应为=$D [$(date +%m-%d' '%H:%M) 源=$DES_SRC zen=$ZEN]，纠正"
+    fix "$D"
+    log "  纠正后 cur=$C"
 done
 log "守护到期（${SPAN}s），退出"
-EOS
 EOS
     chmod 755 "$NIGHT_HELPER" 2>/dev/null
     # 结束上一代守护，避免两代同时纠偏
@@ -1165,9 +1214,9 @@ EOS
             kill "$_old" 2>/dev/null && echo "    --- 结束上一代夜间守护 pid=$_old"
         fi
     fi
-    setsid sh "$NIGHT_HELPER" "$_pm" "$LOGDIR/gs-night.log" "${NIGHT_SPAN:-43200}" "${NIGHT_STEP:-600}" </dev/null >/dev/null 2>&1 &
+    setsid sh "$NIGHT_HELPER" "$_pm" "$LOGDIR/gs-night.log" "${NIGHT_SPAN:-43200}" "${NIGHT_STEP:-120}" </dev/null >/dev/null 2>&1 &
     echo $! > "$GS_DIR/.gs-night.pid" 2>/dev/null
-    echo "    --- 已挂夜间模式守护：模式=$_pm 重启前昼夜=$_pd，之后每 ${NIGHT_STEP:-600}s 复查、共 ${NIGHT_SPAN:-43200}s（日志 $LOGDIR/gs-night.log）"
+    echo "    --- 已挂夜间模式守护：模式=$_pm 重启前昼夜=$_pd，之后每 ${NIGHT_STEP:-120}s 复查、共 ${NIGHT_SPAN:-43200}s（日志 $LOGDIR/gs-night.log）"
 }
 
 night_watch_start

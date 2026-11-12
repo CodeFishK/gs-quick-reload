@@ -1,29 +1,19 @@
 # 一键重载模块（gs_quick_reload）· 三星 Galaxy Z Fold7 专用
 
-> **一个按钮，让 KernelSU 模块生效——而不用拿折叠屏的副屏去换。**
+> **一个按钮，让 KernelSU 模块生效——不用拿折叠屏的副屏去换。**
 >
-> 专为 **三星 Galaxy Z Fold7（SM-F966B，One UI 9 / Android 17）** 调制。
-> 点击模块页的「执行」，脚本会按 KernelSU 自己的流程执行 `post-fs-data` / `services`
-> 两个阶段，然后只重启 zygote，**跳过 `stop` / `start`**。SurfaceFlinger 全程存活，
-> 折叠屏的副屏（`port=148`）不会消失。
+> 点「执行」后按 KernelSU 自己的流程跑 `post-fs-data` / `services`，再只重启 zygote，
+> **跳过 `stop` / `start`**；SurfaceFlinger 全程存活，副屏（`port=148`）不掉。
 
-## 适用机型：三星 Galaxy Z Fold7（专用）
+## 适用机型：仅限三星 Galaxy Z Fold7
 
-> **本模块专为 Z Fold7 调制。** 三星 Galaxy Z Fold7（SM-F966B），
-> 系统 **One UI 9 / Android 17**，内核 6.6.127（KMI `android15-6.6`，
-> 这里的 `android15` 是内核分支命名，与系统版本号无关），
-> root 环境为 [GhostSam](https://github.com/snothin/GhostSam) 晚加载临时 root。
+SM-F966B，One UI 9 / Android 17，内核 6.6.127（KMI `android15-6.6`，`android15` 只是内核分支名），
+root 用 [GhostSam](https://github.com/snothin/GhostSam) 晚加载临时 root（或任意 KernelSU 兼容分支）。
 
-整套流程、看门狗时序、夜间模式纠正逻辑、lspd 健康判据，都是在这一台机器上反复实测调出来的
-（包括「副屏 `port=148` 整场不掉」这个核心收益）。所以默认按 **Fold7 + Android 17** 交付，
-`compatibility.androidMinApi` 也钉在 37（Android 17）。
-
-其他三星折叠屏（Fold6 / Flip 系列）或别的 Android 版本，原理相通但**没有实测**；
-要用的话请先跑一次 `check` 体检，出问题请提 issue 并附机型与系统版本。
+看门狗时序、夜间模式判据、lspd 健康判据都是在这台机器上实测出来的，`compatibility.androidMinApi` 钉在 37。
+其他折叠屏或系统版本原理相通但**未经实测**：先跑一次 `check`，出问题请附机型与系统版本提 issue。
 
 - 作者：CodeFishK · https://github.com/CodeFishK
-- 适用 root 环境：[GhostSam](https://github.com/snothin/GhostSam)（三星临时 root，冷启动后需重新获取）
-  或任意 KernelSU / 兼容分支
 
 ---
 
@@ -96,12 +86,18 @@ sh /data/adb/modules/gs_quick_reload/gs-reload-modules.sh check
 重启 zygote 会让 `TwilightService` 丢状态，之后系统**不会自己重算**：要么直接翻深色，
 要么卡在浅色不动，一直等到你手动去设置里重设一次。
 
-从 **v2.3** 起，守护改用「绝对判据」：每次都从 `dumpsys uimode` 读 `sunrise` / `sunset`
-（拿不到就按 19:00–07:00 回落），算出「此刻应该深色还是浅色」，**不再和「重启前是什么」比较**。
+从 **v2.3** 起，守护改用「绝对判据」：算出「此刻应该深色还是浅色」，**不再和「重启前是什么」比较**。
+判据按优先级取：
+
+1. `dumpsys uimode` 里的 `sunrise` / `sunset`（Twilight 真的有值时）；
+2. 三星自带的「黑暗模式定时」`settings get system display_night_theme_*`（定时开启 + 自定义时间）；
+3. 兜底 19:00–07:00。
 
 - 重启后 45 秒、90 秒各查一次（这个窗口最容易丢判定）；
-- 之后每 10 分钟复查一次、持续 12 小时 —— 日落 / 日出这两个边界即使系统没生效，也会在 10 分钟内被拉回；
-- 你一旦自己改了模式（切成始终浅色 / 深色），守护立刻退出，不跟你抢。
+- 之后**每 2 分钟**复查一次、持续 12 小时 —— v2.3 的 10 分钟间隔太粗，实测里出现「屏幕亮了近 2 分钟才被纠回」；
+- 你一旦自己改了模式（切成始终浅色 / 深色），守护立刻退出，不跟你抢；
+- **防拉锯**：30 分钟内被外部改回 5 次，就主动让位 45 分钟 —— 说明有别的例程在争这个开关，
+  继续对打只会耗电，日志里会写明「让位」。
 
 三个实测结论：
 
@@ -112,9 +108,12 @@ sh /data/adb/modules/gs_quick_reload/gs-reload-modules.sh check
    并回读 `settings get secure ui_night_mode` 校验。
 3. **不能拿「重启前那一刻的判定」当基准**。11-12 20:19 那次重载：日落 17:11，
    重启前后都是 `false`，旧版据此判定「正确」就收工，整晚没变深色，直到手动重设。
-   现在按 Twilight 算绝对答案，这类情况在第一次检查（重启后 45 秒）就会被纠正。
+   现在算绝对答案，这类情况在第一次检查（重启后 45 秒）就会被纠正。
+4. **Z Fold7 上 Twilight 经常是空的**（`mTwilightService.getLastTwilightState()=null`），
+   而且系统会自己把模式拨回浅色 —— 11-13 00:12 就是 `com.samsung.android.lool` 干的。
+   所以判据要能在「没有日出日落」时退到三星自己的定时设置上，复查间隔也不能太长。
 
-想调节奏可以用环境变量：`NIGHT_STEP`（复查间隔，默认 600 秒）、`NIGHT_SPAN`（守护总时长，默认 43200 秒）。
+想调节奏可以用环境变量：`NIGHT_STEP`（复查间隔，默认 120 秒）、`NIGHT_SPAN`（守护总时长，默认 43200 秒）。
 
 真遇到了，用 `night` 子命令收尾：
 
