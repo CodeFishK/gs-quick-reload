@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# gs-reload-modules.sh  v21 — 让 KernelSU 模块生效，但不执行 stop/start
+# gs-reload-modules.sh  v22 — 让 KernelSU 模块生效，但不执行 stop/start
 # （随「一键重载模块 gs_quick_reload」一起分发，装在 /data/adb/modules/gs_quick_reload/）
 #
 # 背景：KernelSU 的「软重启」== ksud 的 soft_reboot()，实际序列是：
@@ -152,6 +152,15 @@
 #      ③ 纠正最多重试 3 轮，每轮都回读判定，不再「一次不成就强制固定」。
 #      ④ 新增子命令 `night`：一条命令把夜间模式还原成「0=自动(日落到日出)」，
 #         并按当时的钟点校验昼夜判定，不需要 root。
+#
+# v22：夜间守护改成「绝对判据 + 周期复查」（11-12 20:19 实测事故）。
+#      ① v21 用「重启前的判定」当基准 → 重启前若已经是错的，就把错的当对的。
+#         那次日落 17:11，20:21 仍是 false，守护写「判定正确」就收工，整晚没变深色。
+#      ② 现在每次都用 Twilight 的 sunrise/sunset（拿不到按 19:00-07:00）算「此刻该不该深色」，
+#         不再相信重启前的值；重启后 45s / 90s 各纠一次。
+#      ③ 之后每 10 分钟复查、持续 12 小时，覆盖日落与日出两个边界（系统不生效也会被拉回）。
+#      ④ 用户一旦改了模式（0/3 → 1/2 等），守护立即退出，不跟用户抢。
+#      ⑤ `night` 子命令同样改为按 Twilight 判定，不再是「沿用系统判定」。
 #
 # 用法：
 #   sh /data/adb/modules/gs_quick_reload/gs-reload-modules.sh   # 模块自带副本（推荐）
@@ -455,12 +464,23 @@ ensure_lspd() {
 # 背景：`ui_night_mode` 的取值是 0=自动(日落到日出) 1=始终浅色 2=始终深色 3=自定义时间表。
 #   守护进程一旦在「强制固定 → 还原」之间被打断（终端断开、进程被 kill），
 #   模式就会停在 1/2 上，表现就是「夜间模式不再自动」。这条命令专门收这个尾。
+_nm_to_min() {
+    _x=$1; _h=${_x%%:*}; _m=${_x##*:}
+    _h=${_h#0}; _m=${_m#0}
+    [ -z "$_h" ] && _h=0
+    [ -z "$_m" ] && _m=0
+    echo $((_h*60+_m))
+}
+
 night_now() {
     _stored=$(settings get secure ui_night_mode 2>/dev/null)
     case "$_stored" in ""|null) _stored=0 ;; esac
-    _cur=$(dumpsys uimode 2>/dev/null | grep -o 'mComputedNightMode=[a-z]*' | head -1 | cut -d= -f2)
+    _u=$(dumpsys uimode 2>/dev/null)
+    _cur=$(echo "$_u" | grep -o 'mComputedNightMode=[a-z]*' | head -1 | cut -d= -f2)
     [ -z "$_cur" ] && _cur=false
-    _tw=$(dumpsys uimode 2>/dev/null | grep -o 'getLastTwilightState()=[a-z]*' | head -1 | cut -d= -f2)
+    _tw=$(echo "$_u" | grep -o 'getLastTwilightState()=[a-z]*' | head -1 | cut -d= -f2)
+    _ss=$(echo "$_u" | grep -o 'sunset=[0-9-]* [0-9:]*' | head -1); _ss=${_ss##* }
+    _sr=$(echo "$_u" | grep -o 'sunrise=[0-9-]* [0-9:]*' | head -1); _sr=${_sr##* }
 
     # 目标是「自动」：本来就是自定义时间表(3)的保留 3，其余一律回到 0(日落到日出)。
     # 注意不要把 1/2 当成目标 —— 那样等于把「始终浅色/深色」又写了一遍。
@@ -474,13 +494,17 @@ night_now() {
     echo "  目标模式   : $_target"
     echo "  当前判定   : $_cur  (true=深色)"
     echo "  钟点       : $(date +%H:%M)   Twilight=$_tw"
-    if [ "$_tw" = "null" ]; then
-        echo "  提示：Twilight 为 null（拿不到日出日落），系统按 19:00-07:00 回落"
-        _h=$(date +%H | sed 's/^0//')
-        if [ -n "$_h" ] && { [ "$_h" -ge 19 ] || [ "$_h" -lt 7 ]; }; then _desired=true; else _desired=false; fi
+
+    # v22：有真实日出日落就用它算，别再「沿用系统判定」——
+    # 系统判定本身就可能卡错（11-12 20:21 就是这样，日落 17:11 却还是浅色）。
+    _now=$(_nm_to_min "$(date +%H:%M)")
+    if [ -n "$_ss" ] && [ -n "$_sr" ]; then
+        echo "  日出日落   : 日出 $_sr / 日落 $_ss"
+        _ssm=$(_nm_to_min "$_ss"); _srm=$(_nm_to_min "$_sr")
+        if [ "$_now" -ge "$_ssm" ] || [ "$_now" -lt "$_srm" ]; then _desired=true; else _desired=false; fi
     else
-        # 有 Twilight 时算不出日落时刻，就沿用系统自己的判定
-        _desired=$_cur
+        echo "  提示：拿不到日出日落（Twilight=$_tw），按 19:00-07:00 回落计算"
+        if [ "$_now" -ge 1140 ] || [ "$_now" -lt 420 ]; then _desired=true; else _desired=false; fi
     fi
     echo "  应为判定   : $_desired"
 
@@ -987,11 +1011,17 @@ if [ "$DO_ZYGOTE" = "0" ]; then
     exit 0
 fi
 
-# --------------------------------------------------- 夜间模式守护（v6）
-# 现象：ui_night_mode 为「自动/定时」时，重启框架后 TwilightService 状态丢失，
-#       One UI 会在拿到定位前回落成深色，且不会自己纠正。
-# 做法：重启前把「用户模式 + 当时的昼夜判定」记下来，detach 一个守护进程，
-#       等 system_server 起来后对比，发现偏了就拨回来，再还原用户原本的模式。
+# --------------------------------------------- 夜间模式守护（v22）
+# 现象：ui_night_mode 为「自动/日落到日出」时，重启 zygote 会让 TwilightService 丢状态，
+#       系统既可能直接翻深色，也可能卡在浅色不动 —— 而且**到了日落/日出也不会自己重算**
+#       （11-12 20:19 那次重载：日落 17:11，20:21 仍然 pre=false/post=false，
+#        v21 用「与重启前比对」判定，把错的当成对的，直到用户手动重设才恢复）。
+# 做法：v22 不再相信「重启前是什么」，而是每次都用 Twilight 的 sunrise/sunset
+#       （拿不到就按 19:00-07:00）算出「此刻应该深色还是浅色」，然后
+#       1) 重启后 45s、90s 各纠一次；
+#       2) 之后每 10 分钟复查一次，持续 12 小时 —— 日落/日出两个边界即使系统没生效，
+#          也会在 10 分钟内被拉回；
+#       3) 用户一旦自己改了模式（0/3 → 1/2 等），守护立即退出，不跟用户抢。
 #       守护进程必须 setsid，否则 zygote 重启时被 SIGHUP 带走。
 night_watch_start() {
     _pm=$(settings get secure ui_night_mode 2>/dev/null)
@@ -1005,17 +1035,20 @@ night_watch_start() {
 
     cat > "$NIGHT_HELPER" <<'EOS'
 #!/system/bin/sh
-# v21 夜间模式纠偏守护
+# v22 夜间模式守护：按 Twilight 算「此刻该黑还是该亮」，周期性纠偏
 #   MODE = 用户原本的模式（0 自动 / 3 定时 / 1 浅色 / 2 深色）
-#   PRE  = 重启前那一刻的昼夜判定（true=深色）
-# 实测（11-01 10:09）：auto 模式下 computed 卡在错误值时，单发 `cmd uimode night auto`
-# 不会触发重算，值一动不动。必须先给一个明确的固定值把它顶过去，再回到 auto。
-# 而「顶」的那一步一旦被打断（终端断开 / 进程被 kill），模式就留在固定值上，
-# 表现出来就是「夜间模式不再自动」——所以这里加了 trap，任何路径都还原。
-MODE=$1; PRE=$2
-LOG=${3:-/data/local/tmp/gs-night.log}
+#   LOG  = 日志路径
+#   SPAN = 总守护时长（秒），默认 12h；STEP = 复查间隔（秒），默认 10min
+# 实测坑（11-01）：auto 下 computed 卡错时，单发 `cmd uimode night auto` 不触发重算，
+#   必须先给一个明确的固定值把它顶过去，再回到 auto 才有用。
+# 实测坑（11-12）：v21 拿「重启前的判定」当基准，一旦重启前就已经是错的，
+#   纠正逻辑会把错的当成对的 —— 所以 v22 改成绝对判据（Twilight）。
+MODE=$1
+LOG=${2:-/sdcard/GS/logs/gs-night.log}
+SPAN=${3:-43200}
+STEP=${4:-600}
+
 log() { echo "[$(date +%m-%d' '%H:%M:%S)] $*" >> "$LOG"; chmod 644 "$LOG" 2>/dev/null; }
-cur() { dumpsys uimode 2>/dev/null | grep -o 'mComputedNightMode=[a-z]*' | head -1 | cut -d= -f2; }
 setmode() {
     case "$1" in
         0) cmd uimode night auto ;;
@@ -1024,54 +1057,117 @@ setmode() {
         2) cmd uimode night yes ;;
     esac
 }
+to_min() {
+    _x=$1; _h=${_x%%:*}; _m=${_x##*:}
+    _h=${_h#0}; _m=${_m#0}
+    [ -z "$_h" ] && _h=0
+    [ -z "$_m" ] && _m=0
+    echo $((_h*60+_m))
+}
+# 读一次 dumpsys，取出判定与日出日落（Twilight 为空是常态，靠 19:00-07:00 兜底）
+read_state() {
+    _u=$(dumpsys uimode 2>/dev/null)
+    C=$(echo "$_u" | grep -o 'mComputedNightMode=[a-z]*' | head -1 | cut -d= -f2)
+    [ -z "$C" ] && C=unknown
+    SS=$(echo "$_u" | grep -o 'sunset=[0-9-]* [0-9:]*' | head -1); SS=${SS##* }
+    SR=$(echo "$_u" | grep -o 'sunrise=[0-9-]* [0-9:]*' | head -1); SR=${SR##* }
+}
+# 此刻「应该」是不是深色：日落之后或日出之前 → true
+desired() {
+    _now=$(to_min "$(date +%H:%M)")
+    if [ -n "$SS" ] && [ -n "$SR" ]; then
+        _ss=$(to_min "$SS"); _sr=$(to_min "$SR")
+        if [ "$_now" -ge "$_ss" ] || [ "$_now" -lt "$_sr" ]; then echo true; else echo false; fi
+    else
+        if [ "$_now" -ge 1140 ] || [ "$_now" -lt 420 ]; then echo true; else echo false; fi
+    fi
+}
+# 纠正：先顶固定值 → 再回到用户模式（实测必须这个顺序）
+fix() {
+    if [ "$1" = "true" ]; then cmd uimode night yes; else cmd uimode night no; fi
+    sleep 3
+    setmode "$MODE" >/dev/null 2>&1
+    sleep 4
+    _v=$(settings get secure ui_night_mode 2>/dev/null)
+    [ "$_v" = "$MODE" ] || { sleep 1; setmode "$MODE" >/dev/null 2>&1; }
+}
 restore() {
     trap - EXIT INT TERM HUP
     [ "${_RESTORED:-0}" = "1" ] && return 0
     _RESTORED=1
     setmode "$MODE" >/dev/null 2>&1
-    _v=$(settings get secure ui_night_mode 2>/dev/null)
-    if [ "$_v" != "$MODE" ]; then
-        sleep 1
-        setmode "$MODE" >/dev/null 2>&1
-        _v=$(settings get secure ui_night_mode 2>/dev/null)
-    fi
-    log "restore mode=$_v"
+    log "restore mode=$(settings get secure ui_night_mode 2>/dev/null)（守护结束）"
 }
 trap 'restore; exit 0' EXIT INT TERM HUP
 
 : > "$LOG"
-log "start mode=$MODE pre_dark=$PRE"
+log "start mode=$MODE span=${SPAN}s step=${STEP}s"
 
+# 等 system_server 起来（重启 zygote 后它可能还在初始化）
 i=0
 while [ $i -lt 180 ]; do
     [ "$(getprop sys.boot_completed)" = "1" ] && pidof system_server >/dev/null 2>&1 && break
     sleep 2; i=$((i+1))
 done
-sleep 45
 
-C=$(cur); [ -z "$C" ] && C=$PRE
-log "post_dark=$C"
-
-n=0
-while [ "$C" != "$PRE" ] && [ $n -lt 3 ]; do
-    n=$((n+1))
-    if [ "$PRE" = "false" ]; then cmd uimode night no; else cmd uimode night yes; fi
-    sleep 3
-    setmode "$MODE" >/dev/null 2>&1
-    sleep 4
-    C=$(cur); [ -z "$C" ] && C=$PRE
-    log "第 $n 轮纠正后 post_dark=$C"
+# 第一段：重启后 45s、90s 各查一次（这个窗口最容易出现「判定丢失」）
+for _d in 45 45; do
+    sleep "$_d"
+    read_state
+    case "$C" in
+        true|false) ;;
+        *) log "首次检查：dumpsys 读不到判定（C=$C），本轮跳过"; continue ;;
+    esac
+    D=$(desired)
+    log "首次检查 cur=$C 应为=$D（sunset=${SS:-无} sunrise=${SR:-无}）"
+    if [ "$C" != "$D" ]; then
+        fix "$D"
+        read_state
+        log "  纠正后 cur=$C"
+    fi
 done
 
-if [ "$C" = "$PRE" ]; then
-    log "判定正确，模式已还原 $MODE"
-else
-    log "仍偏（$C != $PRE），模式已还原 $MODE；如需手动确认：设置-显示-深色模式"
-fi
+# 第二段：周期性复查，覆盖日落/日出两个边界
+_end=$(( $(date +%s) + SPAN ))
+_last=$C
+while [ "$(date +%s)" -lt "$_end" ]; do
+    sleep "$STEP"
+    _m=$(settings get secure ui_night_mode 2>/dev/null)
+    if [ "$_m" != "$MODE" ]; then
+        log "用户改了模式（$MODE -> $_m），守护退出，不再干预"
+        trap - EXIT INT TERM HUP
+        exit 0
+    fi
+    read_state
+    case "$C" in
+        true|false) ;;
+        *) _last=""; continue ;;
+    esac
+    D=$(desired)
+    if [ "$C" != "$D" ]; then
+        log "复查发现偏差 cur=$C 应为=$D（$(date +%m-%d' '%H:%M)），纠正"
+        fix "$D"
+        read_state
+        log "  纠正后 cur=$C"
+    elif [ "$C" != "$_last" ]; then
+        log "状态变化 cur=$C（$(date +%H:%M)），正常"
+    fi
+    _last=$C
+done
+log "守护到期（${SPAN}s），退出"
+EOS
 EOS
     chmod 755 "$NIGHT_HELPER" 2>/dev/null
-    setsid sh "$NIGHT_HELPER" "$_pm" "$_pd" "$LOGDIR/gs-night.log" </dev/null >/dev/null 2>&1 &
-    echo "    --- 已挂夜间模式守护：模式=$_pm 当前昼夜=$_pd（日志 $LOGDIR/gs-night.log）"
+    # 结束上一代守护，避免两代同时纠偏
+    if [ -f "$GS_DIR/.gs-night.pid" ]; then
+        _old=$(cat "$GS_DIR/.gs-night.pid" 2>/dev/null)
+        if [ -n "$_old" ] && [ -d "/proc/$_old" ]; then
+            kill "$_old" 2>/dev/null && echo "    --- 结束上一代夜间守护 pid=$_old"
+        fi
+    fi
+    setsid sh "$NIGHT_HELPER" "$_pm" "$LOGDIR/gs-night.log" "${NIGHT_SPAN:-43200}" "${NIGHT_STEP:-600}" </dev/null >/dev/null 2>&1 &
+    echo $! > "$GS_DIR/.gs-night.pid" 2>/dev/null
+    echo "    --- 已挂夜间模式守护：模式=$_pm 重启前昼夜=$_pd，之后每 ${NIGHT_STEP:-600}s 复查、共 ${NIGHT_SPAN:-43200}s（日志 $LOGDIR/gs-night.log）"
 }
 
 night_watch_start
